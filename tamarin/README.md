@@ -7,6 +7,8 @@ This subfolder contains the Tamarin code used to model and verify the security p
 3. Open the tamarin web interface and manually step through proofs
 
 ## Graphs
+Here are the graphs drawn by tamarin for the attacks it found. The thesis pdf describes how to interpret them.
+
 - **New_Functionality-Read-File**
   ![New_Functionality-Read-File](graphs/New_Functionality-Read-File.png)
 - **New_Functionality-Write-File**

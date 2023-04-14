@@ -1,0 +1,571 @@
+/*
+Sharekey File Chunking
+======================================
+
+Authors:    Pascal Schärli
+Date:           March 2023
+*/
+
+theory NewChunkedEncryption2
+begin
+
+builtins: hashing, symmetric-encryption, signing, multiset
+
+/*
+* Communication Channels
+*/
+
+// If Sharekey is dishonest, leak everything Sharekey receives
+rule Dishonest_Sharekey_1:
+    [
+        To_Sharekey($User, data)
+    ]
+  --[
+        Dishonest_SK()
+    ]->
+    [
+        Out(data)
+    ]
+
+
+// If Sharekey is dishonest, let adversary control their outputs
+rule Dishonest_Sharekey_2:
+    [
+        In(data)
+    ]
+  --[
+        Dishonest_SK()
+    ]->
+    [
+        From_Sharekey($User, data)
+    ]
+
+
+// If a user is dishonest, leak everything they receive
+rule Dishonest_User_1:
+    [
+        From_Sharekey($User, data)
+    ]
+  --[
+        Dishonest($User)
+    ]->
+    [
+        Out(data)
+    ]
+
+
+// If a user is dishonest, let adversary control their outputs
+rule Dishonest_User_2:
+    [
+        In(data)
+    ]
+  --[
+        Dishonest($User)
+    ]->
+    [
+        To_Sharekey($User, data)
+    ]
+
+
+/*
+PROTOCOL
+*/
+
+rule Create_User:
+    [
+        Fr(~user_sk_sig),        Fr(~user_sk_enc)
+    ]
+  --[
+        Once(<'Create_User', $User>)
+    ]->
+    [
+        !Sk($User, ~user_sk_sig, ~user_sk_enc),        !Pk($User, pk(~user_sk_sig)),        Out(pk(~user_sk_sig))
+    ]
+
+
+rule Reveal_User_Keys:
+    [
+        !Sk($User, ~user_sk_sig, ~user_sk_enc)
+    ]
+  --[
+        Dishonest($User)
+  ]->
+    [
+        Out(~user_sk_sig),        Out(~user_sk_enc)
+    ]
+
+
+rule Sharekey_Generate_Ids:
+    [
+        Fr(~file_id),
+    ]
+  -->
+    [
+        !DB_File_Header($Owner, ~file_id),        // Difference: no preview chunks
+        From_Sharekey($Owner, <'FILE_IDs', ~file_id>),        // Regard Ids as public
+        Out(~file_id)
+    ]
+
+
+rule U_File_Upload:
+    let
+        sk_file_enc_byuser = senc(~file_sk_enc, owner_sk_enc)
+        chunk_1_enc = senc(~chunk_1, ~file_sk_enc)
+        chunk_1_hash = h(chunk_1_enc)
+        chunk_2_enc = senc(~chunk_2, ~file_sk_enc)
+        chunk_2_hash = h(chunk_2_enc)
+        metadata_enc = senc(~metadata, ~file_sk_enc)
+        metadata_hash = h(metadata_enc)
+        fingerprint = h(<$Owner, file_id, metadata_hash, <chunk_1_hash, chunk_2_hash>>)
+        fingerprint_sig = sign(fingerprint, ~file_sk_sig)
+    in
+    [
+        // Generate new keys
+        Fr(~file_sk_enc),
+        Fr(~file_sk_sig),
+
+        // File content
+        Fr(~chunk_1),        Fr(~chunk_2),
+
+        // metadata, e.g. file name
+        Fr(~metadata),
+
+        // Owner's secret key
+        !Sk($Owner, owner_sk_sig, owner_sk_enc),
+        // Obtain File IDs from Sharekey
+        From_Sharekey($Owner, <'FILE_IDs', file_id>)
+    ]
+    --[
+        U_Created_File($Owner),
+        U_Write_File($Owner, file_id, ~metadata, <~chunk_1, ~chunk_2>),
+        U_Write_File_Ctxt($Owner, file_id, metadata_enc, <chunk_1_enc, chunk_2_enc>)
+    ]->
+    [
+        !O_File_Info($Owner, file_id, ~file_sk_sig, ~file_sk_enc),
+
+        // Difference: no sk_file_enc_byparent
+        To_Sharekey($Owner, <
+            'FILE_HEADER', file_id,
+            fingerprint, fingerprint_sig,
+            sk_file_enc_byuser,
+            metadata_enc, <chunk_1_hash, chunk_2_hash>,
+            pk(~file_sk_sig), sign(pk(~file_sk_sig), owner_sk_sig)
+        >),
+        To_Sharekey($Owner, <'FILE_CHUNKS', file_id, <chunk_1_enc, chunk_2_enc>>)
+    ]
+
+// Sharekey receives file header
+rule Sharekey_Header_In:
+    let
+        fingerprint2 = h(<$Owner, file_id, h(metadata_enc), <chunk_1_hash, chunk_2_hash>>)
+    in
+    [
+    !Pk($Owner, owner_pk_sig),
+    !DB_File_Header($Owner, file_id),    To_Sharekey($Owner, <
+        'FILE_HEADER', file_id,
+        fingerprint, fingerprint_sig,
+        sk_file_enc_byuser,
+        metadata_enc, <chunk_1_hash, chunk_2_hash>,
+        file_pk_sig, signature_file_pk_sig
+    >)
+]
+--[
+    Eq(verify(signature_file_pk_sig, file_pk_sig, owner_pk_sig), true),
+    Eq(verify(fingerprint_sig, fingerprint, file_pk_sig), true),
+    Eq(fingerprint, fingerprint2)
+]->
+[
+    !DB_File_Header2($Owner, file_id, fingerprint, fingerprint_sig, sk_file_enc_byuser, metadata_enc, <chunk_1_hash, chunk_2_hash>, file_pk_sig, signature_file_pk_sig)
+]
+// Sharekey receives the chunk nr. 1 of a 2-chunk file
+rule Sharekey_File_In:
+    [
+        !DB_File_Header2($Owner, file_id, fingerprint, fingerprint_sig, sk_file_enc_byuser, metadata_enc, <chunk_1_hash, chunk_2_hash>, file_pk_sig, signature_file_pk_sig),
+        To_Sharekey($Anyone, <'FILE_CHUNKS', file_id, <chunk_1_enc, chunk_2_enc>>),
+        !Pk($Owner, owner_pk_sig)
+    ]
+  --[
+        // Verify chunk signature with public key stored in database
+        Eq(h(chunk_1_enc), chunk_1_hash),
+        Eq(h(chunk_2_enc), chunk_2_hash),
+        S_Receive_File($Owner, $Anyone, file_id, metadata_enc, <chunk_1_hash, chunk_2_hash>, <chunk_1_enc, chunk_2_enc>)
+    ]->
+    [
+        !DB_File($Owner, file_id,
+            fingerprint, fingerprint_sig,
+            sk_file_enc_byuser,
+            metadata_enc, <chunk_1_hash, chunk_2_hash>,
+            file_pk_sig, signature_file_pk_sig, <chunk_1_enc, chunk_2_enc>
+        )
+    ]
+
+// Share read access (encryption key of a file with another user
+// (can currently only be done by Owner)
+rule U_Share_Read:
+    [
+        !O_File_Info($Owner, file_id, file_sk_sig, file_sk_enc)
+    ]
+  --[
+        U_Shared_Read(file_id, $Reader),        Sources_Shared_Sk_Enc($Owner, file_sk_enc)
+    ]->
+    [
+        !U_File_Sk_Enc($Owner, $Reader, file_id, file_sk_enc)
+    ]
+
+
+// Sharekey sends file contents to some user
+rule Sharekey_Send_File_2:
+    [
+        !DB_File($Owner, file_id,
+            fingerprint, fingerprint_sig,
+            sk_file_enc_byuser,
+            metadata_enc, <chunk_1_hash, chunk_2_hash>,
+            file_pk_sig, signature_file_pk_sig, <chunk_1_enc, chunk_2_enc>
+        )
+    ]
+  --[
+        Send($Owner, $Reader, file_id, <chunk_1_enc, chunk_2_enc>)
+    ]->
+    [
+        From_Sharekey($Reader, <'Send_File', $Owner, file_id,
+            fingerprint, fingerprint_sig,
+            sk_file_enc_byuser,
+            metadata_enc, <chunk_1_hash, chunk_2_hash>,
+            file_pk_sig, signature_file_pk_sig, <chunk_1_enc, chunk_2_enc>
+        >)
+    ]
+
+
+rule U_Read_File_2:
+    let
+        metadata_enc = senc(metadata, file_sk_enc)
+        chunk_1_enc = senc(chunk_1, file_sk_enc)
+        chunk_2_enc = senc(chunk_2, file_sk_enc)
+        fingerprint2 = h(<$Owner, file_id, h(metadata_enc), <chunk_1_hash, chunk_2_hash>>)
+    in
+    [
+        !Pk($Owner, owner_pk_sig),
+        !U_File_Sk_Enc($Reader, $Reader, file_id, file_sk_enc),
+        From_Sharekey($Reader, <'Send_File', $Owner, file_id,
+            fingerprint, fingerprint_sig,
+            sk_file_enc_byuser,
+            metadata_enc, <chunk_1_hash, chunk_2_hash>,
+            file_pk_sig, signature_file_pk_sig, <chunk_1_enc, chunk_2_enc>
+        >)
+    ]
+    --[
+        Eq(fingerprint, fingerprint2),
+        Eq(h(chunk_1_enc), chunk_1_hash),
+        Eq(h(chunk_2_enc), chunk_2_hash),
+        Eq(verify(signature_file_pk_sig, file_pk_sig, owner_pk_sig), true),
+        Eq(verify(fingerprint_sig, fingerprint, file_pk_sig), true),
+        U_Read_File($Owner, $Reader, file_id, metadata, <chunk_1, chunk_2>),
+        U_Read_File_Ctxt($Owner, $Reader, file_id, metadata_enc, <chunk_1_enc, chunk_2_enc>)
+    ]->
+    [
+        U_File_Content($Owner, $Reader, file_id, metadata, <<chunk_1, chunk_1_enc>, <chunk_2, chunk_2_enc>>)
+    ]
+
+rule U_Reveal_File_Infos:
+    [
+        !U_File_Sk_Enc($Owner, $Reader, file_id, file_sk_enc)
+    ]
+  --[
+        Dishonest($Reader),        U_Revealed_File_Infos($Owner, $Reader, file_id)
+    ]->
+    [
+        Out(file_id),        Out(file_sk_enc)
+    ]
+
+
+rule O_Reveal_File_Infos:
+    [
+        !O_File_Info($Owner, file_id, file_sk_sig, file_sk_enc)
+    ]
+  --[
+        Dishonest($Owner),        O_Revealed_File_Infos($Owner, file_id)
+    ]->
+    [
+        Out(file_id),        Out(file_sk_sig),        Out(file_sk_enc)
+    ]
+
+
+/*
+RESTRICTIONS
+*/
+
+// For signature checks
+restriction Equality:
+  "All x y #i. Eq(x,y) @i ==> x = y"
+
+restriction once:
+  "All x #i #j. Once(x)@i & Once(x)@j ==> #i = #j"
+
+/*
+SOURCES
+*/
+
+/*
+PROPERTIES
+*/
+// Show that it's possible for a user to write a file
+lemma functionality_write_file:
+    exists-trace
+    "/* there exist a trace where */
+    Ex Owner file_id metadata ptxt #i.
+        /* A file owner can write a file */
+        U_Write_File(Owner, file_id, metadata, ptxt) @ i
+        /* without any dishonest users */
+        & not (Ex User #d. Dishonest(User) @ d)
+        /* and without dishonest Sharekey */
+        & not (Ex #d. Dishonest_SK() @ d)
+    "
+
+// Show that it's possible for a user to write a file and someone reading it
+lemma functionality_read_file:
+    exists-trace
+    "/* there exist a trace where */
+    Ex Owner Reader file_id metadata ptxt #i #j.
+        /* A file owner can write a file */
+        U_Write_File(Owner, file_id, metadata, ptxt) @ i
+        /* and some reader can read that file */
+        & U_Read_File(Owner, Reader, file_id, metadata, ptxt) @ j
+        /* without any dishonest users */
+        & not (Ex User #d. Dishonest(User) @ d)
+        /* and without dishonest Sharekey */
+        & not (Ex #d. Dishonest_SK() @ d)
+    "
+
+// Show that it's not possible for the adversary to know the contents of
+// the metadata even if sharekey is dishonest
+lemma confidentiality_metadata_dishonest_sharekey:
+    "/* For any combinations of owners and files */
+    All Owner file_id metadata ptxt #i.
+        /* when the owner writes a file */
+        U_Write_File(Owner, file_id, metadata, ptxt) @ i
+        /* and no user is dishonest (except sharekey) */
+        & (not Ex User #d. Dishonest(User) @ d)
+    ==> (
+        /* the adversary does not know the metadata */
+        not Ex #k. K(metadata) @ k
+    )"
+
+// Show that it's not possible for the adversary to know the contents of
+// the file content even if sharekey is dishonest
+lemma confidentiality_ptxt_dishonest_sharekey:
+    "/* For any combinations of owners and files */
+    All Owner file_id metadata ptxt #i.
+        /* when the owner writes a file */
+        U_Write_File(Owner, file_id, metadata, ptxt) @ i
+        /* and no user is dishonest (except sharekey) */
+        & (not Ex User #d. Dishonest(User) @ d)
+    ==> (
+        /* the adversary does not know the file content */
+        not Ex #k. K(ptxt) @ k
+    )"
+
+// Show that if sharekey and the file reader are honest and the owner only uploads
+// one file, the adversary cannot change the contents of the file metadata
+lemma integrity_metadata_dishonest_reader_u1:
+    "/* For any combination of owner reader and file */
+    All Owner Reader file_id metadata ptxt1 #i.
+        /* If a user reads a file */
+        U_Read_File(Owner, Reader, file_id, metadata, ptxt1) @ i
+        /* and sharekey is not dishonest */
+        & (not Ex #d. Dishonest_SK() @ d & d < i)
+        /* and the owner is not dishonest */
+        & (not Ex #d. Dishonest(Owner) @ d & d < i)
+        /* and the owner is restricted to only one file upload */
+        & (All #i #j. U_Created_File(Owner)@i & U_Created_File(Owner)@j ==> #i = #j) // Owner can only upload once
+    ==> (
+        /* Then the metadata read by the user must have been written by the owner */
+        Ex ptxt2 #w. U_Write_File(Owner, file_id, metadata, ptxt2) @ w & w < i
+    )"
+
+// Show that if sharekey and the file reader are honest and the owner only uploads
+// one file, the adversary cannot change the contents of the file metadata
+lemma integrity_metadata_dishonest_owner_u1:
+    "/* For any combination of owner reader and file */
+    All Owner Reader file_id metadata ptxt1 #i.
+        /* If a user reads a file */
+        U_Read_File(Owner, Reader, file_id, metadata, ptxt1) @ i
+        /* and sharekey is not dishonest */
+        & (not Ex #d. Dishonest_SK() @ d & d < i)
+        /* and the reader is not dishonest */
+        & (not Ex #d. Dishonest(Reader) @ d & d < i)
+        /* and the owner is restricted to only one file upload */
+        & (All #i #j. U_Created_File(Owner)@i & U_Created_File(Owner)@j ==> #i = #j) // Owner can only upload once
+    ==> (
+        /* Then the metadata read by the user must have been written by the owner */
+        Ex ptxt2 #w. U_Write_File(Owner, file_id, metadata, ptxt2) @ w & w < i
+    )"
+
+// Show that if the file owner and the file reader are honest and the owner only uploads
+// one file, the adversary cannot change the contents of the file metadata
+lemma integrity_metadata_dishonest_sharekey_u1:
+    "/* For any combination of owner reader and file */
+    All Owner Reader file_id metadata ptxt1 #i.
+        /* If a user reads a file */
+        U_Read_File(Owner, Reader, file_id, metadata, ptxt1) @ i
+        /* and the reader is not dishonest */
+        & (not Ex #d. Dishonest(Reader) @ d & d < i)
+        /* and the owner is not dishonest */
+        & (not Ex #d. Dishonest(Owner) @ d & d < i)
+        /* and the owner is restricted to only one file upload */
+        & (All #i #j. U_Created_File(Owner)@i & U_Created_File(Owner)@j ==> #i = #j) // Owner can only upload once
+    ==> (
+        /* Then the metadata read by the user must have been written by the owner */
+        Ex ptxt2 #w. U_Write_File(Owner, file_id, metadata, ptxt2) @ w & w < i
+    )"
+
+// Show that if sharekey and the file reader are honest and the owner only uploads
+// one file, the adversary cannot change the contents of the file plaintext
+lemma integrity_ptxt_dishonest_reader_u1:
+    "/* For any combination of owner reader and file */
+    All Owner Reader file_id metadata1 ptxt #i.
+        /* If a user reads a file */
+        U_Read_File(Owner, Reader, file_id, metadata1, ptxt) @ i
+        /* and sharekey is not dishonest */
+        & (not Ex #d. Dishonest_SK() @ d & d < i)
+        /* and the owner is not dishonest */
+        & (not Ex #d. Dishonest(Owner) @ d & d < i)
+        /* and the owner is restricted to only one file upload */
+        & (All #i #j. U_Created_File(Owner)@i & U_Created_File(Owner)@j ==> #i = #j) // Owner can only upload once
+    ==> (
+        /* Then the plaintext read by the user must have been written by the owner */
+        Ex metadata2 #w. U_Write_File(Owner, file_id, metadata2, ptxt) @ w & w < i
+    )"
+
+// Show that if sharekey and the file reader are honest and the owner only uploads
+// one file, the adversary cannot change the contents of the file plaintext
+lemma integrity_ptxt_dishonest_owner_u1:
+    "/* For any combination of owner reader and file */
+    All Owner Reader file_id metadata1 ptxt #i.
+        /* If a user reads a file */
+        U_Read_File(Owner, Reader, file_id, metadata1, ptxt) @ i
+        /* and sharekey is not dishonest */
+        & (not Ex #d. Dishonest_SK() @ d & d < i)
+        /* and the reader is not dishonest */
+        & (not Ex #d. Dishonest(Reader) @ d & d < i)
+        /* and the owner is restricted to only one file upload */
+        & (All #i #j. U_Created_File(Owner)@i & U_Created_File(Owner)@j ==> #i = #j) // Owner can only upload once
+    ==> (
+        /* Then the plaintext read by the user must have been written by the owner */
+        Ex metadata2 #w. U_Write_File(Owner, file_id, metadata2, ptxt) @ w & w < i
+    )"
+
+// Show that if the file owner and the file reader are honest and the owner only uploads
+// one file, the adversary cannot change the contents of the file plaintext
+lemma integrity_ptxt_dishonest_sharekey_u1:
+    "/* For any combination of owner reader and file */
+    All Owner Reader file_id metadata1 ptxt #i.
+        /* If a user reads a file */
+        U_Read_File(Owner, Reader, file_id, metadata1, ptxt) @ i
+        /* and the reader is not dishonest */
+        & (not Ex #d. Dishonest(Reader) @ d & d < i)
+        /* and the owner is not dishonest */
+        & (not Ex #d. Dishonest(Owner) @ d & d < i)
+        /* and the owner is restricted to only one file upload */
+        & (All #i #j. U_Created_File(Owner)@i & U_Created_File(Owner)@j ==> #i = #j) // Owner can only upload once
+    ==> (
+        /* Then the plaintext read by the user must have been written by the owner */
+        Ex metadata2 #w. U_Write_File(Owner, file_id, metadata2, ptxt) @ w & w < i
+    )"
+
+// Show that if sharekey and the file reader are honest and the owner only uploads
+// one file, the adversary cannot change the contents of the file metadata
+lemma integrity_metadata_dishonest_reader:
+    "/* For any combination of owner reader and file */
+    All Owner Reader file_id metadata ptxt1 #i.
+        /* If a user reads a file */
+        U_Read_File(Owner, Reader, file_id, metadata, ptxt1) @ i
+        /* and sharekey is not dishonest */
+        & (not Ex #d. Dishonest_SK() @ d & d < i)
+        /* and the owner is not dishonest */
+        & (not Ex #d. Dishonest(Owner) @ d & d < i)
+    ==> (
+        /* Then the metadata read by the user must have been written by the owner */
+        Ex ptxt2 #w. U_Write_File(Owner, file_id, metadata, ptxt2) @ w & w < i
+    )"
+
+// Show that if sharekey and the file reader are honest and the owner only uploads
+// one file, the adversary cannot change the contents of the file metadata
+lemma integrity_metadata_dishonest_owner:
+    "/* For any combination of owner reader and file */
+    All Owner Reader file_id metadata ptxt1 #i.
+        /* If a user reads a file */
+        U_Read_File(Owner, Reader, file_id, metadata, ptxt1) @ i
+        /* and sharekey is not dishonest */
+        & (not Ex #d. Dishonest_SK() @ d & d < i)
+        /* and the reader is not dishonest */
+        & (not Ex #d. Dishonest(Reader) @ d & d < i)
+    ==> (
+        /* Then the metadata read by the user must have been written by the owner */
+        Ex ptxt2 #w. U_Write_File(Owner, file_id, metadata, ptxt2) @ w & w < i
+    )"
+
+// Show that if the file owner and the file reader are honest and the owner only uploads
+// one file, the adversary cannot change the contents of the file metadata
+lemma integrity_metadata_dishonest_sharekey:
+    "/* For any combination of owner reader and file */
+    All Owner Reader file_id metadata ptxt1 #i.
+        /* If a user reads a file */
+        U_Read_File(Owner, Reader, file_id, metadata, ptxt1) @ i
+        /* and the reader is not dishonest */
+        & (not Ex #d. Dishonest(Reader) @ d & d < i)
+        /* and the owner is not dishonest */
+        & (not Ex #d. Dishonest(Owner) @ d & d < i)
+    ==> (
+        /* Then the metadata read by the user must have been written by the owner */
+        Ex ptxt2 #w. U_Write_File(Owner, file_id, metadata, ptxt2) @ w & w < i
+    )"
+
+// Show that if sharekey and the file reader are honest and the owner only uploads
+// one file, the adversary cannot change the contents of the file plaintext
+lemma integrity_ptxt_dishonest_reader:
+    "/* For any combination of owner reader and file */
+    All Owner Reader file_id metadata1 ptxt #i.
+        /* If a user reads a file */
+        U_Read_File(Owner, Reader, file_id, metadata1, ptxt) @ i
+        /* and sharekey is not dishonest */
+        & (not Ex #d. Dishonest_SK() @ d & d < i)
+        /* and the owner is not dishonest */
+        & (not Ex #d. Dishonest(Owner) @ d & d < i)
+    ==> (
+        /* Then the plaintext read by the user must have been written by the owner */
+        Ex metadata2 #w. U_Write_File(Owner, file_id, metadata2, ptxt) @ w & w < i
+    )"
+
+// Show that if sharekey and the file reader are honest and the owner only uploads
+// one file, the adversary cannot change the contents of the file plaintext
+lemma integrity_ptxt_dishonest_owner:
+    "/* For any combination of owner reader and file */
+    All Owner Reader file_id metadata1 ptxt #i.
+        /* If a user reads a file */
+        U_Read_File(Owner, Reader, file_id, metadata1, ptxt) @ i
+        /* and sharekey is not dishonest */
+        & (not Ex #d. Dishonest_SK() @ d & d < i)
+        /* and the reader is not dishonest */
+        & (not Ex #d. Dishonest(Reader) @ d & d < i)
+    ==> (
+        /* Then the plaintext read by the user must have been written by the owner */
+        Ex metadata2 #w. U_Write_File(Owner, file_id, metadata2, ptxt) @ w & w < i
+    )"
+
+// Show that if the file owner and the file reader are honest and the owner only uploads
+// one file, the adversary cannot change the contents of the file plaintext
+lemma integrity_ptxt_dishonest_sharekey:
+    "/* For any combination of owner reader and file */
+    All Owner Reader file_id metadata1 ptxt #i.
+        /* If a user reads a file */
+        U_Read_File(Owner, Reader, file_id, metadata1, ptxt) @ i
+        /* and the reader is not dishonest */
+        & (not Ex #d. Dishonest(Reader) @ d & d < i)
+        /* and the owner is not dishonest */
+        & (not Ex #d. Dishonest(Owner) @ d & d < i)
+    ==> (
+        /* Then the plaintext read by the user must have been written by the owner */
+        Ex metadata2 #w. U_Write_File(Owner, file_id, metadata2, ptxt) @ w & w < i
+    )"
+
+end
